@@ -1,53 +1,58 @@
 // src/engine/whatsapp.engine.js
 
-import * as baileys from "@whiskeysockets/baileys";
-
-const makeWASocket = baileys.default || baileys.makeWASocket;
-const {
+import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} = baileys;
+} from "@whiskeysockets/baileys";
+
+let sockGlobal = null;
+let isInitializing = false;
 
 export async function initWhatsApp() {
-  if (typeof makeWASocket !== "function") {
-    throw new Error(
-      "Baileys não expôs makeWASocket como função. Verifique a versão instalada e o build."
-    );
-  }
+  if (isInitializing) return sockGlobal;
+  isInitializing = true;
 
-  const sessionPath = process.env.SESSION_PATH || "./sessao_definitiva";
+  try {
+    const sessionPath = process.env.SESSION_PATH || "./sessao_definitiva";
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-  const { version } = await fetchLatestBaileysVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    auth: state,
-    version,
-    printQRInTerminal: true
-  });
+    const sock = makeWASocket({
+      auth: state,
+      version,
+      printQRInTerminal: true
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    sockGlobal = sock;
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on("creds.update", saveCreds);
 
-    if (qr) console.log("📲 QR gerado. Escaneie no WhatsApp.");
+    sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (connection === "open") console.log("✅ WhatsApp conectado.");
+      if (qr) console.log("📲 QR gerado. Escaneie no WhatsApp.");
 
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      if (connection === "open") console.log("✅ WhatsApp conectado.");
 
-      console.log("❌ WhatsApp desconectou.", statusCode || "");
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      if (shouldReconnect) {
-        console.log("🔄 Reconectando...");
-        initWhatsApp();
+        console.log("❌ WhatsApp desconectou.", statusCode || "");
+
+        if (shouldReconnect) {
+          console.log("🔄 Reconectando em 3s...");
+          setTimeout(() => {
+            initWhatsApp().catch((e) => console.error("Erro ao reconectar:", e));
+          }, 3000);
+        }
       }
-    }
-  });
+    });
 
-  return sock;
+    return sock;
+  } finally {
+    isInitializing = false;
+  }
 }
