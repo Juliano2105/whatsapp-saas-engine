@@ -1,42 +1,49 @@
-import makeWASocket, { useMultiFileAuthState } from "@whiskeysockets/baileys"
-import { supabase } from "../config/supabase.js"
-import { runAutomationForMessage } from "./automation.engine.js"
+// src/engine/whatsapp.engine.js
+
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} from "@whiskeysockets/baileys";
 
 export async function initWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(
-    process.env.SESSION_PATH || "./sessao_definitiva"
-  )
+  const sessionPath = process.env.SESSION_PATH || "./sessao_definitiva";
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     auth: state,
+    version,
     printQRInTerminal: true
-  })
+  });
 
-  sock.ev.on("creds.update", saveCreds)
+  sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
-    global.connectionStatus = update
-  })
+    const { connection, lastDisconnect, qr } = update;
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.key?.remoteJid) continue
-
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        ""
-
-      const payload = {
-        message_id: msg.key.id,
-        chat_id: msg.key.remoteJid,
-        from_me: !!msg.key.fromMe,
-        text,
-        timestamp: Number(msg.messageTimestamp) * 1000
-      }
-
-      await supabase.from("messages").upsert(payload)
-      await runAutomationForMessage(payload)
+    if (qr) {
+      console.log("QR gerado, escaneie no WhatsApp");
     }
-  })
+
+    if (connection === "open") {
+      console.log("WhatsApp conectado");
+    }
+
+    if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log("WhatsApp desconectou", statusCode || "");
+
+      if (shouldReconnect) {
+        initWhatsApp();
+      } else {
+        console.log("Deslogado do WhatsApp, precisa escanear novamente");
+      }
+    }
+  });
+
+  return sock;
 }
