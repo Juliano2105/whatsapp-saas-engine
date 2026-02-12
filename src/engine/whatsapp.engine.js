@@ -1,3 +1,4 @@
+// src/engine/whatsapp.engine.js
 import * as baileys from "@whiskeysockets/baileys";
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
@@ -8,29 +9,30 @@ const {
   DisconnectReason
 } = baileys;
 
-let sockGlobal = null;
-let lastQrGlobal = null;
-
-let connectionGlobal = "starting";
-let lastDisconnectCodeGlobal = null;
-let lastErrorGlobal = null;
+let sockRef = null;
+let lastQr = null;
+let lastConnection = "idle";
+let lastDisconnectCode = null;
+let lastError = null;
 
 export function getWhatsAppStatus() {
   return {
-    connection: connectionGlobal,
-    lastDisconnectCode: lastDisconnectCodeGlobal,
-    hasQr: Boolean(lastQrGlobal),
-    qr: lastQrGlobal || null,
-    hasSocket: Boolean(sockGlobal),
-    lastError: lastErrorGlobal
+    connection: lastConnection,
+    lastDisconnectCode,
+    hasQr: Boolean(lastQr),
+    qr: lastQr,
+    hasSocket: Boolean(sockRef),
+    lastError: lastError ? String(lastError?.message || lastError) : null
   };
+}
+
+export function getLastQr() {
+  return lastQr;
 }
 
 export async function initWhatsApp() {
   if (typeof makeWASocket !== "function") {
-    connectionGlobal = "error";
-    lastErrorGlobal = "makeWASocket not available";
-    throw new Error("Baileys não expôs makeWASocket como função");
+    throw new Error("Baileys não expôs makeWASocket como função.");
   }
 
   const sessionPath = process.env.SESSION_PATH || "./sessao_definitiva";
@@ -38,16 +40,14 @@ export async function initWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const { version } = await fetchLatestBaileysVersion();
 
-  connectionGlobal = "connecting";
-  lastErrorGlobal = null;
-
   const sock = makeWASocket({
     auth: state,
     version,
     printQRInTerminal: true
   });
 
-  sockGlobal = sock;
+  sockRef = sock;
+  lastError = null;
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -55,37 +55,34 @@ export async function initWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      lastQrGlobal = qr;
-      console.log("QR gerado escaneie no WhatsApp");
+      lastQr = qr;
+      console.log("📲 QR gerado. Abra /qr.png para escanear.");
     }
 
-    if (connection) connectionGlobal = connection;
+    if (connection) {
+      lastConnection = connection;
+    }
 
     if (connection === "open") {
-      console.log("WhatsApp conectado");
-      lastQrGlobal = null;
-      lastDisconnectCodeGlobal = null;
-      lastErrorGlobal = null;
+      console.log("✅ WhatsApp conectado.");
+      lastQr = null;
+      lastDisconnectCode = null;
     }
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode || null;
-      lastDisconnectCodeGlobal = statusCode;
+      lastDisconnectCode = statusCode;
 
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      console.log("WhatsApp desconectou", statusCode || "");
+      console.log("❌ WhatsApp desconectou.", statusCode || "");
 
       if (shouldReconnect) {
-        connectionGlobal = "reconnecting";
-        setTimeout(() => {
-          initWhatsApp().catch((e) => {
-            lastErrorGlobal = e?.message || String(e);
-            console.error("Falha ao reconectar", lastErrorGlobal);
-          });
-        }, 1500);
-      } else {
-        connectionGlobal = "logged_out";
+        console.log("🔄 Reconectando...");
+        initWhatsApp().catch((e) => {
+          lastError = e;
+          console.error("Erro ao reconectar:", e?.message || e);
+        });
       }
     }
   });
