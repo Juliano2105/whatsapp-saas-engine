@@ -1,29 +1,37 @@
-import express from "express"
-import cors from "cors"
-import dotenv from "dotenv"
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
 
-import chatRoutes from "./routes/chat.routes.js"
-import messageRoutes from "./routes/message.routes.js"
-import statusRoutes from "./routes/status.routes.js"
-import { initWhatsApp } from "./engine/whatsapp.engine.js"
-import { errorHandler } from "./middleware/error.middleware.js"
+import { initWhatsApp, getWhatsAppStatus } from "./engine/whatsapp.engine.js";
 
-dotenv.config()
+dotenv.config();
 
-const app = express()
+const app = express();
 
-app.use(cors())
-app.use(express.json())
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-app.use("/status", statusRoutes)
-app.use("/chats", chatRoutes)
-app.use("/messages", messageRoutes)
+app.get("/", (req, res) => {
+  res.status(200).send("OK whatsapp saas engine online");
+});
 
-app.use(errorHandler)
+app.get("/status", (req, res) => {
+  const status = getWhatsAppStatus();
+  res.status(200).json(status);
+});
 
-const PORT = process.env.PORT || 3000
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+const PORT = Number(process.env.PORT || 8080);
 
 app.listen(PORT, async () => {
-  console.log("Servidor rodando na porta", PORT)
-  await initWhatsApp()
-})
+  console.log("Servidor rodando na porta", PORT);
+
+  try {
+    await initWhatsApp();
+  } catch (err) {
+    console.error("Falha ao iniciar WhatsApp", err?.message || err);
+  }
+});
