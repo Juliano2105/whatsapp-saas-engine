@@ -34,8 +34,15 @@ function extractText(msg) {
 }
 
 function upsertMessage(chatId, m) {
-  const msgId =
-    m.key?.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const msgId = m.key?.id;
+  if (!msgId) return;
+
+  const arr = messagesMap.get(chatId) || [];
+
+  // 🔒 Impede duplicação
+  if (arr.find((x) => x.id === msgId)) {
+    return;
+  }
 
   const item = {
     id: msgId,
@@ -45,24 +52,21 @@ function upsertMessage(chatId, m) {
     participant: m.key?.participant || null
   };
 
-  const arr = messagesMap.get(chatId) || [];
   arr.push(item);
 
-  if (arr.length > 500) arr.splice(0, arr.length - 500);
+  if (arr.length > 500) {
+    arr.splice(0, arr.length - 500);
+  }
 
   messagesMap.set(chatId, arr);
-
-  const lastTimestamp = item.timestamp;
-  const lastMessage =
-    item.text || (item.fromMe ? "Mensagem enviada" : "Mensagem");
 
   const existing = chatsMap.get(chatId) || { chatId, name: chatId };
 
   chatsMap.set(chatId, {
     ...existing,
     chatId,
-    lastMessage,
-    lastTimestamp
+    lastMessage: item.text || (item.fromMe ? "Mensagem enviada" : "Mensagem"),
+    lastTimestamp: item.timestamp
   });
 }
 
@@ -87,10 +91,6 @@ export function getWhatsAppStatus() {
     ...status,
     hasSocket: !!sock
   };
-}
-
-export function getSock() {
-  return sock;
 }
 
 export function getQrString() {
@@ -137,13 +137,7 @@ export async function sendText(chatIdOrNumber, text) {
 export async function initWhatsApp() {
   status.lastError = null;
 
-  if (typeof makeWASocket !== "function") {
-    status.lastError = "makeWASocket não é função";
-    throw new Error("Baileys não expôs makeWASocket como função.");
-  }
-
   const sessionPath = process.env.SESSION_PATH || "./sessao_definitiva";
-
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -183,13 +177,10 @@ export async function initWhatsApp() {
     if (connection === "close") {
       console.log("WhatsApp desconectou", code || "");
 
-      status.lastError =
-        code === DisconnectReason.loggedOut ? "logged_out" : null;
-
-      status.hasQr = false;
-      status.qr = null;
-
-      console.log("Reiniciando sessão e gerando novo QR...");
+      if (code === DisconnectReason.loggedOut) {
+        status.lastError = "logged_out";
+        return;
+      }
 
       setTimeout(() => {
         initWhatsApp();
