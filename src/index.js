@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // index.js — Servidor Express completo para Motor WhatsApp
-// Caminho no Railway: index.js (raiz do projeto)
+// Caminho no Railway: src/index.js
 // ═══════════════════════════════════════════════════════════════
 
 import express from "express";
@@ -55,13 +55,12 @@ import {
   getReceiptStore,
   getUpdates,
   mediaDir
-} from "./src/engine/whatsapp.engine.js";
+} from "./engine/whatsapp.engine.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-// ─── Mídia estática ───────────────────────────────────────────
 app.use("/media", express.static(mediaDir));
 
 // ═══════════════════════════════════════════════════════════════
@@ -89,7 +88,7 @@ app.get("/qr.png", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// 2. CONVERSAS (CHATS)
+// 2. CONVERSAS
 // ═══════════════════════════════════════════════════════════════
 
 app.get("/chats", (req, res) => {
