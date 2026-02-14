@@ -1,5 +1,5 @@
 // src/engine/whatsapp.engine.js
-// ✅ VERSÃO FINAL — mídia + histórico + keep-alive
+// ✅ VERSÃO FINAL — mídia + histórico + keep-alive + getSocket
 import * as baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
@@ -13,6 +13,11 @@ const {
 } = baileys;
 
 let sock = null;
+
+// ✅ Exportar acesso ao socket (para endpoints de grupo no index.js)
+export function getSocket() {
+  return sock;
+}
 
 const status = {
   connection: "close",
@@ -269,7 +274,6 @@ export async function initWhatsApp() {
   });
 
   // ✅ KEEP-ALIVE: impede desconexão por inatividade
-  // Envia presença "available" a cada 25 segundos
   setInterval(async () => {
     if (sock && status.connection === "open") {
       try {
@@ -316,7 +320,7 @@ export async function initWhatsApp() {
     }
   });
 
-  // ✅ HISTÓRICO: captura todas as conversas e mensagens do WhatsApp ao conectar
+  // ✅ HISTÓRICO: captura todas as conversas e mensagens ao conectar
   sock.ev.on("messaging-history.set", async ({ chats, messages, isLatest }) => {
     console.log(`[history] Recebido: ${chats?.length || 0} conversas, ${messages?.length || 0} mensagens (isLatest: ${isLatest})`);
 
