@@ -1,5 +1,5 @@
 // src/engine/whatsapp.engine.js
-// ✅ ATUALIZADO — com suporte a mídia (imagem, vídeo, áudio, documento, sticker)
+// ✅ VERSÃO FINAL — mídia + histórico + keep-alive
 import * as baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
@@ -30,7 +30,6 @@ const messagesMap = new Map();
 const MEDIA_DIR = process.env.MEDIA_DIR || "./media";
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
-// ─── Exportar caminho da mídia (para o express.static no index.js) ──
 export const mediaDir = MEDIA_DIR;
 
 // ─── Detectar tipo de mídia ────────────────────────────────────
@@ -112,7 +111,7 @@ function extractText(msg) {
   );
 }
 
-// ✅ Agora é async para suportar download de mídia
+// ✅ Async para suportar download de mídia
 async function upsertMessage(chatId, m) {
   const msgId = m.key?.id;
   if (!msgId) return;
@@ -136,7 +135,6 @@ async function upsertMessage(chatId, m) {
     text: extractText(m.message) || mediaData?.caption || "",
     timestamp: Number(m.messageTimestamp || Date.now()),
     participant: m.key?.participant || null,
-    // ✅ Campos de mídia
     type: mediaData?.type || "text",
     mediaUrl: mediaData?.mediaUrl || null,
     mimeType: mediaData?.mimeType || null,
@@ -156,7 +154,6 @@ async function upsertMessage(chatId, m) {
 
   const existing = chatsMap.get(chatId) || { chatId, name: chatId };
 
-  // ✅ Preview melhorado para mídia na sidebar
   let preview = item.text;
   if (!preview && mediaData) {
     const icons = { image: "📷 Foto", video: "🎬 Vídeo", audio: "🎵 Áudio", document: "📎 Documento", sticker: "🖼️ Figurinha" };
@@ -168,6 +165,26 @@ async function upsertMessage(chatId, m) {
     chatId,
     lastMessage: preview || (item.fromMe ? "Mensagem enviada" : "Mensagem"),
     lastTimestamp: item.timestamp
+  });
+}
+
+// ─── Inserção rápida de chat do histórico (sem mídia) ──────────
+function upsertChatFromHistory(chat) {
+  const jid = chat.id;
+  if (!jid || jid === "status@broadcast") return;
+
+  const existing = chatsMap.get(jid) || {};
+  const ts = Number(chat.conversationTimestamp || chat.muteExpiration || 0);
+
+  chatsMap.set(jid, {
+    chatId: jid,
+    name: chat.name || chat.subject || existing.name || jid,
+    lastMessage: existing.lastMessage || chat.lastMessage?.conversation || "",
+    lastTimestamp: ts > (existing.lastTimestamp || 0) ? ts : (existing.lastTimestamp || ts),
+    unreadCount: chat.unreadCount || existing.unreadCount || 0,
+    pinned: chat.pinned || chat.pin || existing.pinned || false,
+    archived: chat.archived || chat.archive || existing.archived || false,
+    ...existing
   });
 }
 
@@ -251,6 +268,16 @@ export async function initWhatsApp() {
     printQRInTerminal: true
   });
 
+  // ✅ KEEP-ALIVE: impede desconexão por inatividade
+  // Envia presença "available" a cada 25 segundos
+  setInterval(async () => {
+    if (sock && status.connection === "open") {
+      try {
+        await sock.sendPresenceUpdate("available");
+      } catch {}
+    }
+  }, 25000);
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
@@ -289,7 +316,71 @@ export async function initWhatsApp() {
     }
   });
 
-  // ✅ Async para suportar download de mídia
+  // ✅ HISTÓRICO: captura todas as conversas e mensagens do WhatsApp ao conectar
+  sock.ev.on("messaging-history.set", async ({ chats, messages, isLatest }) => {
+    console.log(`[history] Recebido: ${chats?.length || 0} conversas, ${messages?.length || 0} mensagens (isLatest: ${isLatest})`);
+
+    if (chats && chats.length > 0) {
+      for (const chat of chats) {
+        upsertChatFromHistory(chat);
+      }
+      console.log(`[history] ${chats.length} conversas importadas. Total: ${chatsMap.size}`);
+    }
+
+    if (messages && messages.length > 0) {
+      let count = 0;
+      for (const m of messages) {
+        const chatId = m.key?.remoteJid;
+        if (!chatId || chatId === "status@broadcast") continue;
+        try {
+          await upsertMessage(chatId, m);
+          count++;
+        } catch (err) {
+          console.error("[history] Erro ao importar msg:", m.key?.id, err.message);
+        }
+      }
+      console.log(`[history] ${count} mensagens importadas`);
+    }
+  });
+
+  // ✅ Novas conversas
+  sock.ev.on("chats.upsert", (newChats) => {
+    for (const chat of newChats) {
+      upsertChatFromHistory(chat);
+    }
+  });
+
+  // ✅ Atualizações de conversas (não lidas, pin, arquivo)
+  sock.ev.on("chats.update", (updates) => {
+    for (const update of updates) {
+      const jid = update.id;
+      if (!jid) continue;
+      const existing = chatsMap.get(jid) || { chatId: jid, name: jid };
+      if (update.unreadCount !== undefined) existing.unreadCount = update.unreadCount;
+      if (update.archived !== undefined) existing.archived = update.archived;
+      if (update.pinned !== undefined) existing.pinned = update.pinned;
+      if (update.conversationTimestamp) {
+        const ts = Number(update.conversationTimestamp);
+        if (ts > (existing.lastTimestamp || 0)) existing.lastTimestamp = ts;
+      }
+      chatsMap.set(jid, existing);
+    }
+  });
+
+  // ✅ Contatos (nomes da agenda)
+  sock.ev.on("contacts.upsert", (contacts) => {
+    for (const c of contacts) {
+      const jid = c.id;
+      if (!jid) continue;
+      const existing = chatsMap.get(jid);
+      if (existing && !existing.name && (c.name || c.notify)) {
+        existing.name = c.name || c.notify;
+        chatsMap.set(jid, existing);
+      }
+    }
+  });
+
+  // ✅ Mensagens em tempo real (com mídia)
   sock.ev.on("messages.upsert", async ({ messages }) => {
     for (const m of messages || []) {
       const chatId = m.key?.remoteJid;
