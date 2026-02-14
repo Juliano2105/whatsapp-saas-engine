@@ -9,6 +9,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import fs from "fs";
@@ -202,7 +203,9 @@ class WhatsAppSession {
         if (msg.message) {
           try {
             await this._saveMedia(msg);
-          } catch {}
+          } catch (err) {
+            console.error(`[${this.sessionId}] Erro _saveMedia:`, err.message);
+          }
         }
       }
     });
@@ -275,6 +278,19 @@ class WhatsAppSession {
     );
   }
 
+  _detectMediaInfo(msgObj) {
+    if (msgObj.imageMessage) return { sub: msgObj.imageMessage, type: "image", ext: ".jpg" };
+    if (msgObj.videoMessage) return { sub: msgObj.videoMessage, type: "video", ext: ".mp4" };
+    if (msgObj.audioMessage) return { sub: msgObj.audioMessage, type: "audio", ext: msgObj.audioMessage.ptt ? ".ogg" : ".mp3" };
+    if (msgObj.documentMessage) {
+      const fname = msgObj.documentMessage.fileName || "file";
+      const ext = path.extname(fname) || ".bin";
+      return { sub: msgObj.documentMessage, type: "document", ext };
+    }
+    if (msgObj.stickerMessage) return { sub: msgObj.stickerMessage, type: "sticker", ext: ".webp" };
+    return null;
+  }
+
   _normalizeMessage(raw) {
     const msg = raw.message || {};
     const key = raw.key || {};
@@ -284,14 +300,16 @@ class WhatsAppSession {
         : Number(raw.messageTimestamp || 0);
 
     let type = "text";
-    if (msg.imageMessage) type = "image";
-    else if (msg.videoMessage) type = "video";
-    else if (msg.audioMessage) type = "audio";
-    else if (msg.documentMessage) type = "document";
-    else if (msg.stickerMessage) type = "sticker";
-    else if (msg.contactMessage || msg.contactsArrayMessage) type = "contact";
-    else if (msg.locationMessage || msg.liveLocationMessage) type = "location";
-    else if (msg.pollCreationMessage || msg.pollCreationMessageV3) type = "poll";
+    const mediaInfo = this._detectMediaInfo(msg);
+    if (mediaInfo) {
+      type = mediaInfo.type;
+    } else if (msg.contactMessage || msg.contactsArrayMessage) {
+      type = "contact";
+    } else if (msg.locationMessage || msg.liveLocationMessage) {
+      type = "location";
+    } else if (msg.pollCreationMessage || msg.pollCreationMessageV3) {
+      type = "poll";
+    }
 
     return {
       id: key.id,
@@ -310,11 +328,46 @@ class WhatsAppSession {
           }
         : null,
       raw,
+      // Campos de mídia — preenchidos pelo _saveMedia após download
+      mediaUrl: null,
+      mimeType: mediaInfo?.sub?.mimetype || null,
+      fileName: mediaInfo?.sub?.fileName || null,
+      fileSize: mediaInfo?.sub?.fileLength || null,
+      duration: mediaInfo?.sub?.seconds || null,
+      caption: mediaInfo?.sub?.caption || null,
     };
   }
 
   async _saveMedia(msg) {
-    // Implementação básica — pode expandir depois
+    const msgObj = msg.message || {};
+    const mediaInfo = this._detectMediaInfo(msgObj);
+    if (!mediaInfo) return null;
+
+    try {
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      const fileName = `${msg.key.id}${mediaInfo.ext}`;
+      const filePath = path.join(this.mediaPath, fileName);
+      fs.writeFileSync(filePath, buffer);
+      console.log(`[${this.sessionId}] Mídia salva: ${fileName} (${buffer.length} bytes)`);
+
+      // Atualizar a mensagem no store com a URL da mídia
+      const chatId = msg.key.remoteJid;
+      if (this.messages[chatId]) {
+        const idx = this.messages[chatId].findIndex((m) => m.id === msg.key.id);
+        if (idx >= 0) {
+          this.messages[chatId][idx].mediaUrl = `/media/${this.sessionId}/${fileName}`;
+          this.messages[chatId][idx].mimeType = mediaInfo.sub.mimetype || null;
+          this.messages[chatId][idx].duration = mediaInfo.sub.seconds || null;
+          this.messages[chatId][idx].fileName = mediaInfo.sub.fileName || null;
+          this.messages[chatId][idx].caption = mediaInfo.sub.caption || null;
+          this.messages[chatId][idx].fileSize = mediaInfo.sub.fileLength || buffer.length;
+        }
+      }
+      return fileName;
+    } catch (err) {
+      console.error(`[${this.sessionId}] Erro ao salvar mídia ${msg.key.id}:`, err.message);
+      return null;
+    }
   }
 
   // ─── API Pública ───
@@ -382,6 +435,26 @@ class WhatsAppSession {
       content.sticker = buffer;
     }
     const result = await this.sock.sendMessage(chatId, content);
+
+    // Salvar a mídia enviada no disco também
+    if (result?.key?.id) {
+      try {
+        let ext = ".bin";
+        if (type === "image") ext = ".jpg";
+        else if (type === "video") ext = ".mp4";
+        else if (type === "audio") ext = ptt ? ".ogg" : ".mp3";
+        else if (type === "sticker") ext = ".webp";
+        else if (type === "document") ext = path.extname(fileName || "") || ".bin";
+
+        const mediaFileName = `${result.key.id}${ext}`;
+        const filePath = path.join(this.mediaPath, mediaFileName);
+        fs.writeFileSync(filePath, buffer);
+        console.log(`[${this.sessionId}] Mídia enviada salva: ${mediaFileName}`);
+      } catch (err) {
+        console.error(`[${this.sessionId}] Erro ao salvar mídia enviada:`, err.message);
+      }
+    }
+
     return { ok: true, id: result?.key?.id };
   }
 
