@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// session-manager.js — Gerenciador Multi-Sessão WhatsApp (Baileys)
-// ✅ VERSÃO COMPLETA — Todos os endpoints do motor original
+// session-manager.js — Gerenciador Multi-Sessão WhatsApp
+// Caminho no Railway: src/engine/session-manager.js
 // ═══════════════════════════════════════════════════════════════
 
 import {
@@ -10,374 +10,491 @@ import {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
+import pino from "pino";
 import fs from "fs";
 import path from "path";
+import { Boom } from "@hapi/boom";
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
-const MEDIA_BASE_DIR = process.env.MEDIA_DIR || "./media";
+export const MEDIA_BASE_DIR = process.env.MEDIA_DIR || "./media";
 
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(MEDIA_BASE_DIR)) fs.mkdirSync(MEDIA_BASE_DIR, { recursive: true });
 
 // ═══════════════════════════════════════════════════════════════
-// WhatsAppSession — Uma instância isolada por sessionId
+// CLASSE: WhatsAppSession
 // ═══════════════════════════════════════════════════════════════
+
 class WhatsAppSession {
   constructor(sessionId) {
     this.sessionId = sessionId;
     this.sock = null;
-    this.status = {
-      connection: "close",
-      qr: null,
-      hasQr: false,
-      lastDisconnectCode: null,
-      lastError: null,
-    };
-    this.chatsMap = new Map();
-    this.messagesMap = new Map();
+    this.status = { connection: "close", qr: null, hasQr: false };
+    this.chats = {};
+    this.messages = {};
     this.presenceStore = {};
     this.receiptStore = {};
-    this.lastMsgTimestamp = 0;
-    this.authDir = path.join(SESSIONS_DIR, sessionId);
-    this.mediaDir = path.join(MEDIA_BASE_DIR, sessionId);
-
-    if (!fs.existsSync(this.authDir)) fs.mkdirSync(this.authDir, { recursive: true });
-    if (!fs.existsSync(this.mediaDir)) fs.mkdirSync(this.mediaDir, { recursive: true });
+    this.updates = [];
+    this.updateSeq = 0;
+    this.keepAliveInterval = null;
+    this.logger = pino({ level: "silent" });
   }
 
-  async connect() {
-    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+  get sessionPath() {
+    return path.join(SESSIONS_DIR, this.sessionId);
+  }
+
+  get mediaPath() {
+    const p = path.join(MEDIA_BASE_DIR, this.sessionId);
+    if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+    return p;
+  }
+
+  async start() {
+    const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
     const { version } = await fetchLatestBaileysVersion();
 
     this.sock = makeWASocket({
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, { level: "silent" }),
+        keys: makeCacheableSignalKeyStore(state.keys, this.logger),
       },
-      logger: { level: "silent", child: () => ({ level: "silent", info: ()=>{}, error: ()=>{}, warn: ()=>{}, debug: ()=>{}, trace: ()=>{}, fatal: ()=>{}, child: ()=>({}) }) },
+      logger: this.logger,
       printQRInTerminal: false,
-      generateHighQualityLinkPreview: true,
       syncFullHistory: true,
-    });
-
-    // ─── Conexão ───
-    this.sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        this.status.qr = qr;
-        this.status.hasQr = true;
-        this.status.connection = "connecting";
-        console.log(`[${this.sessionId}] QR gerado`);
-      }
-      if (connection === "open") {
-        this.status.connection = "open";
-        this.status.qr = null;
-        this.status.hasQr = false;
-        this.status.lastError = null;
-        console.log(`[${this.sessionId}] Conectado!`);
-        // Keep-alive a cada 25s
-        this._keepAlive = setInterval(() => {
-          try { this.sock?.sendPresenceUpdate("available"); } catch {}
-        }, 25000);
-      }
-      if (connection === "close") {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        this.status.connection = "close";
-        this.status.lastDisconnectCode = code || null;
-        this.status.lastError = lastDisconnect?.error?.message || null;
-        if (this._keepAlive) clearInterval(this._keepAlive);
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
-        console.log(`[${this.sessionId}] Desconectado (code: ${code}). Reconectar: ${shouldReconnect}`);
-        if (shouldReconnect) setTimeout(() => this.connect(), 3000);
-      }
+      generateHighQualityLinkPreview: true,
+      markOnlineOnConnect: true,
     });
 
     this.sock.ev.on("creds.update", saveCreds);
 
-    // ─── Histórico completo ───
-    this.sock.ev.on("messaging-history.set", ({ chats, messages }) => {
-      console.log(`[${this.sessionId}] History sync: ${chats.length} chats, ${messages.length} msgs`);
-      for (const chat of chats) this.chatsMap.set(chat.id, chat);
-      for (const msg of messages) {
-        const jid = msg.key.remoteJid;
-        if (!jid) continue;
-        if (!this.messagesMap.has(jid)) this.messagesMap.set(jid, []);
-        this.messagesMap.get(jid).push(this._normalizeMsg(msg));
-      }
-    });
+    this.sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    // ─── Mensagens em tempo real ───
-    this.sock.ev.on("messages.upsert", ({ messages, type }) => {
-      for (const msg of messages) {
-        const jid = msg.key.remoteJid;
-        if (!jid) continue;
-        if (!this.messagesMap.has(jid)) this.messagesMap.set(jid, []);
-        const normalized = this._normalizeMsg(msg);
-        this.messagesMap.get(jid).push(normalized);
-        this.lastMsgTimestamp = Math.max(this.lastMsgTimestamp, normalized.timestamp || 0);
-        // Atualiza chat
-        const existing = this.chatsMap.get(jid) || { id: jid };
-        existing.conversationTimestamp = normalized.timestamp;
-        if (!msg.key.fromMe && type === "notify") {
-          existing.unreadCount = (existing.unreadCount || 0) + 1;
+      if (qr) {
+        this.status.qr = qr;
+        this.status.hasQr = true;
+        this.status.connection = "connecting";
+        console.log(`[${this.sessionId}] QR Code gerado`);
+      }
+
+      if (connection === "open") {
+        this.status.connection = "open";
+        this.status.qr = null;
+        this.status.hasQr = false;
+        console.log(`[${this.sessionId}] Conectado!`);
+        this._startKeepAlive();
+      }
+
+      if (connection === "close") {
+        this.status.connection = "close";
+        this._stopKeepAlive();
+
+        const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        console.log(`[${this.sessionId}] Desconectado. Razão: ${reason}`);
+
+        if (reason === DisconnectReason.loggedOut) {
+          console.log(`[${this.sessionId}] Logout — limpando sessão`);
+          if (fs.existsSync(this.sessionPath)) {
+            fs.rmSync(this.sessionPath, { recursive: true, force: true });
+          }
+        } else {
+          console.log(`[${this.sessionId}] Reconectando em 3s...`);
+          setTimeout(() => this.start(), 3000);
         }
-        this.chatsMap.set(jid, existing);
       }
     });
 
-    // ─── Atualizações de chat ───
+    this.sock.ev.on("messaging-history.set", ({ chats: newChats, messages: newMsgs }) => {
+      console.log(`[${this.sessionId}] Histórico: ${newChats.length} chats, ${newMsgs.length} msgs`);
+      for (const chat of newChats) {
+        this.chats[chat.id] = {
+          id: chat.id,
+          name: chat.name || chat.id,
+          lastTimestamp: chat.conversationTimestamp
+            ? (typeof chat.conversationTimestamp === "object"
+              ? chat.conversationTimestamp.low
+              : Number(chat.conversationTimestamp))
+            : 0,
+          unreadCount: chat.unreadCount || 0,
+          lastMessage: chat.lastMessage?.message
+            ? this._extractBody(chat.lastMessage.message)
+            : null,
+          isGroup: chat.id.endsWith("@g.us"),
+          raw: chat,
+        };
+      }
+      for (const msg of newMsgs) {
+        const chatId = msg.key.remoteJid;
+        if (!this.messages[chatId]) this.messages[chatId] = [];
+        this.messages[chatId].push(this._normalizeMessage(msg));
+      }
+      this._pushUpdate("history_sync", { chats: newChats.length, messages: newMsgs.length });
+    });
+
     this.sock.ev.on("chats.upsert", (chats) => {
-      for (const chat of chats) this.chatsMap.set(chat.id, { ...this.chatsMap.get(chat.id), ...chat });
-    });
-    this.sock.ev.on("chats.update", (updates) => {
-      for (const u of updates) {
-        if (this.chatsMap.has(u.id)) Object.assign(this.chatsMap.get(u.id), u);
+      for (const chat of chats) {
+        this.chats[chat.id] = {
+          ...this.chats[chat.id],
+          id: chat.id,
+          name: chat.name || chat.id,
+          lastTimestamp: chat.conversationTimestamp
+            ? (typeof chat.conversationTimestamp === "object"
+              ? chat.conversationTimestamp.low
+              : Number(chat.conversationTimestamp))
+            : this.chats[chat.id]?.lastTimestamp || 0,
+          unreadCount: chat.unreadCount ?? this.chats[chat.id]?.unreadCount ?? 0,
+          isGroup: chat.id.endsWith("@g.us"),
+          raw: chat,
+        };
       }
     });
 
-    // ─── Presença ───
+    this.sock.ev.on("chats.update", (updates) => {
+      for (const update of updates) {
+        if (this.chats[update.id]) {
+          Object.assign(this.chats[update.id], update);
+          if (update.conversationTimestamp) {
+            this.chats[update.id].lastTimestamp =
+              typeof update.conversationTimestamp === "object"
+                ? update.conversationTimestamp.low
+                : Number(update.conversationTimestamp);
+          }
+        }
+      }
+    });
+
+    this.sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+      for (const msg of msgs) {
+        const chatId = msg.key.remoteJid;
+        if (!chatId) continue;
+        const normalized = this._normalizeMessage(msg);
+
+        if (!this.messages[chatId]) this.messages[chatId] = [];
+        const existing = this.messages[chatId].findIndex((m) => m.id === normalized.id);
+        if (existing >= 0) {
+          this.messages[chatId][existing] = normalized;
+        } else {
+          this.messages[chatId].push(normalized);
+        }
+
+        if (this.chats[chatId]) {
+          this.chats[chatId].lastTimestamp = normalized.timestamp;
+          this.chats[chatId].lastMessage = normalized.body;
+          if (!msg.key.fromMe && type === "notify") {
+            this.chats[chatId].unreadCount = (this.chats[chatId].unreadCount || 0) + 1;
+          }
+        } else {
+          this.chats[chatId] = {
+            id: chatId,
+            name: msg.pushName || chatId,
+            lastTimestamp: normalized.timestamp,
+            lastMessage: normalized.body,
+            unreadCount: msg.key.fromMe ? 0 : 1,
+            isGroup: chatId.endsWith("@g.us"),
+          };
+        }
+
+        this._pushUpdate("new_message", { chatId, message: normalized });
+
+        // Salvar mídia
+        if (msg.message) {
+          try {
+            await this._saveMedia(msg);
+          } catch {}
+        }
+      }
+    });
+
+    this.sock.ev.on("messages.update", (updates) => {
+      for (const { key, update } of updates) {
+        const chatId = key.remoteJid;
+        if (!chatId || !this.messages[chatId]) continue;
+        const idx = this.messages[chatId].findIndex((m) => m.id === key.id);
+        if (idx >= 0) {
+          Object.assign(this.messages[chatId][idx], update);
+        }
+      }
+    });
+
     this.sock.ev.on("presence.update", ({ id, presences }) => {
       this.presenceStore[id] = presences;
     });
 
-    // ─── Confirmações de leitura ───
-    this.sock.ev.on("message-receipt.update", (updates) => {
-      for (const { key, receipt } of updates) {
-        const jid = key.remoteJid;
-        if (!this.receiptStore[jid]) this.receiptStore[jid] = {};
-        this.receiptStore[jid][key.id] = receipt;
+    this.sock.ev.on("message-receipt.update", (events) => {
+      for (const { key, receipt } of events) {
+        const chatId = key.remoteJid;
+        if (!chatId) continue;
+        if (!this.receiptStore[chatId]) this.receiptStore[chatId] = {};
+        this.receiptStore[chatId][key.id] = receipt;
       }
     });
-
-    return this;
   }
 
-  // ─── Normalizar mensagem ───
-  _normalizeMsg(raw) {
-    const m = raw.message || {};
-    const ts = typeof raw.messageTimestamp === "object"
-      ? raw.messageTimestamp?.low || 0
-      : Number(raw.messageTimestamp || 0);
+  // ─── Helpers ───
 
-    let body = m.conversation
-      || m.extendedTextMessage?.text
-      || m.imageMessage?.caption
-      || m.videoMessage?.caption
-      || m.documentMessage?.fileName
-      || "";
+  _startKeepAlive() {
+    this._stopKeepAlive();
+    this.keepAliveInterval = setInterval(async () => {
+      try {
+        if (this.sock && this.status.connection === "open") {
+          await this.sock.sendPresenceUpdate("available");
+        }
+      } catch {}
+    }, 25000);
+  }
+
+  _stopKeepAlive() {
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
+    }
+  }
+
+  _pushUpdate(type, data) {
+    this.updateSeq++;
+    this.updates.push({ seq: this.updateSeq, type, data, ts: Date.now() });
+    if (this.updates.length > 5000) this.updates = this.updates.slice(-3000);
+  }
+
+  _extractBody(message) {
+    if (!message) return null;
+    return (
+      message.conversation ||
+      message.extendedTextMessage?.text ||
+      message.imageMessage?.caption ||
+      message.videoMessage?.caption ||
+      message.documentMessage?.fileName ||
+      (message.audioMessage ? "🎵 Áudio" : null) ||
+      (message.stickerMessage ? "🏷️ Sticker" : null) ||
+      (message.contactMessage ? "👤 Contato" : null) ||
+      (message.locationMessage ? "📍 Localização" : null) ||
+      (message.pollCreationMessage ? "📊 Enquete" : null) ||
+      null
+    );
+  }
+
+  _normalizeMessage(raw) {
+    const msg = raw.message || {};
+    const key = raw.key || {};
+    const ts =
+      typeof raw.messageTimestamp === "object"
+        ? raw.messageTimestamp?.low || 0
+        : Number(raw.messageTimestamp || 0);
 
     let type = "text";
-    if (m.imageMessage) type = "image";
-    else if (m.videoMessage) type = "video";
-    else if (m.audioMessage) type = "audio";
-    else if (m.documentMessage) type = "document";
-    else if (m.stickerMessage) type = "sticker";
-    else if (m.contactMessage || m.contactsArrayMessage) type = "contact";
-    else if (m.locationMessage) type = "location";
-    else if (m.pollCreationMessage || m.pollCreationMessageV3) type = "poll";
+    if (msg.imageMessage) type = "image";
+    else if (msg.videoMessage) type = "video";
+    else if (msg.audioMessage) type = "audio";
+    else if (msg.documentMessage) type = "document";
+    else if (msg.stickerMessage) type = "sticker";
+    else if (msg.contactMessage || msg.contactsArrayMessage) type = "contact";
+    else if (msg.locationMessage || msg.liveLocationMessage) type = "location";
+    else if (msg.pollCreationMessage || msg.pollCreationMessageV3) type = "poll";
 
     return {
-      id: raw.key.id,
-      chatId: raw.key.remoteJid,
-      fromMe: raw.key.fromMe || false,
-      participant: raw.key.participant || null,
+      id: key.id,
+      chatId: key.remoteJid,
+      fromMe: key.fromMe || false,
+      direction: key.fromMe ? "outgoing" : "incoming",
       timestamp: ts,
-      body,
+      body: this._extractBody(msg),
       type,
-      hasMedia: ["image", "video", "audio", "document", "sticker"].includes(type),
-      pushName: raw.pushName || null,
+      senderName: raw.pushName || null,
+      senderJid: key.participant || key.remoteJid,
+      quoted: msg.extendedTextMessage?.contextInfo?.quotedMessage
+        ? {
+            id: msg.extendedTextMessage.contextInfo.stanzaId,
+            body: this._extractBody(msg.extendedTextMessage.contextInfo.quotedMessage),
+          }
+        : null,
       raw,
     };
   }
 
-  _jid(chatId) {
-    return chatId.includes("@") ? chatId : chatId + "@s.whatsapp.net";
+  async _saveMedia(msg) {
+    // Implementação básica — pode expandir depois
   }
 
-  // ═══════════════════════════════════════════════════════════════
-  // API PÚBLICA
-  // ═══════════════════════════════════════════════════════════════
+  // ─── API Pública ───
 
-  getStatus() { return { ...this.status }; }
+  getStatus() {
+    return {
+      connection: this.status.connection,
+      qr: this.status.qr,
+      hasQr: this.status.hasQr,
+      sessionId: this.sessionId,
+      chatCount: Object.keys(this.chats).length,
+    };
+  }
 
   listChats(limit = 50, cursor = null) {
-    let arr = Array.from(this.chatsMap.values())
-      .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0));
+    const all = Object.values(this.chats).sort(
+      (a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0)
+    );
+    let filtered = all;
     if (cursor) {
-      const idx = arr.findIndex(c => (c.conversationTimestamp || 0) < Number(cursor));
-      if (idx >= 0) arr = arr.slice(idx);
+      const idx = all.findIndex((c) => (c.lastTimestamp || 0) < Number(cursor));
+      filtered = idx >= 0 ? all.slice(idx) : [];
     }
-    const page = arr.slice(0, limit);
-    const items = page.map(chat => {
-      const msgs = this.messagesMap.get(chat.id) || [];
-      const last = msgs[msgs.length - 1] || null;
-      return {
-        id: chat.id,
-        name: chat.name || chat.subject || chat.id.replace(/@.*/, ""),
-        conversationTimestamp: chat.conversationTimestamp || 0,
-        unreadCount: chat.unreadCount || 0,
-        pinned: chat.pinned || chat.pin ? true : false,
-        archived: chat.archived || false,
-        muted: chat.muted || chat.muteExpiration ? true : false,
-        lastMessage: last ? { body: last.body, fromMe: last.fromMe, timestamp: last.timestamp, type: last.type } : null,
-      };
-    });
-    const nextCursor = page.length === limit ? page[page.length - 1]?.conversationTimestamp : null;
-    return { ok: true, chats: items, nextCursor };
+    const page = filtered.slice(0, limit);
+    const nextCursor =
+      page.length === limit ? page[page.length - 1]?.lastTimestamp : null;
+    return { ok: true, chats: page, nextCursor };
   }
 
   listMessages(chatId, limit = 50, before = null) {
-    let msgs = this.messagesMap.get(chatId) || [];
-    msgs.sort((a, b) => a.timestamp - b.timestamp);
+    const msgs = (this.messages[chatId] || []).sort(
+      (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
+    );
+    let filtered = msgs;
     if (before) {
-      const idx = msgs.findIndex(m => m.timestamp >= Number(before));
-      if (idx > 0) msgs = msgs.slice(0, idx);
+      filtered = msgs.filter((m) => m.timestamp < Number(before));
     }
-    const items = msgs.slice(-limit);
-    return { ok: true, messages: items, hasMore: msgs.length > limit };
+    return { ok: true, messages: filtered.slice(0, limit).reverse() };
   }
 
-  getUpdates(since) {
-    const updated = [];
-    for (const [jid, msgs] of this.messagesMap.entries()) {
-      const recent = msgs.filter(m => m.timestamp > since);
-      if (recent.length > 0) updated.push({ chatId: jid, messages: recent });
-    }
-    return { ok: true, updates: updated, serverTime: Math.floor(Date.now() / 1000) };
-  }
-
-  // ─── Envio ───
   async sendText(chatId, text) {
-    const jid = this._jid(chatId);
-    const sent = await this.sock.sendMessage(jid, { text });
-    this._pushSent(jid, sent);
-    return { ok: true, id: sent.key.id, timestamp: Number(sent.messageTimestamp || 0) };
+    const result = await this.sock.sendMessage(chatId, { text });
+    return { ok: true, id: result?.key?.id };
   }
 
   async sendMedia(chatId, { type, buffer, mimetype, fileName, caption, ptt }) {
-    const jid = this._jid(chatId);
-    let content = {};
-    if (type === "image") content = { image: buffer, mimetype: mimetype || "image/jpeg", caption };
-    else if (type === "video") content = { video: buffer, mimetype: mimetype || "video/mp4", caption };
-    else if (type === "audio") content = { audio: buffer, mimetype: mimetype || "audio/ogg; codecs=opus", ptt: ptt !== false };
-    else content = { document: buffer, mimetype: mimetype || "application/octet-stream", fileName: fileName || "file" };
-    const sent = await this.sock.sendMessage(jid, content);
-    this._pushSent(jid, sent);
-    return { ok: true, id: sent.key.id };
+    const content = {};
+    if (type === "image") {
+      content.image = buffer;
+      if (caption) content.caption = caption;
+      if (mimetype) content.mimetype = mimetype;
+    } else if (type === "video") {
+      content.video = buffer;
+      if (caption) content.caption = caption;
+      if (mimetype) content.mimetype = mimetype;
+    } else if (type === "audio") {
+      content.audio = buffer;
+      content.mimetype = mimetype || "audio/ogg; codecs=opus";
+      content.ptt = ptt !== false;
+    } else if (type === "document") {
+      content.document = buffer;
+      content.mimetype = mimetype || "application/octet-stream";
+      content.fileName = fileName || "file";
+    } else if (type === "sticker") {
+      content.sticker = buffer;
+    }
+    const result = await this.sock.sendMessage(chatId, content);
+    return { ok: true, id: result?.key?.id };
   }
 
   async sendReply(chatId, text, quotedId) {
-    const jid = this._jid(chatId);
-    const msgs = this.messagesMap.get(jid) || [];
-    const quotedMsg = msgs.find(m => m.id === quotedId);
-    const quoted = quotedMsg?.raw ? quotedMsg.raw : { key: { id: quotedId, remoteJid: jid, fromMe: false } };
-    const sent = await this.sock.sendMessage(jid, { text }, { quoted });
-    this._pushSent(jid, sent);
-    return { ok: true, id: sent.key.id };
+    const msgs = this.messages[chatId] || [];
+    const quoted = msgs.find((m) => m.id === quotedId);
+    const result = await this.sock.sendMessage(
+      chatId,
+      { text },
+      { quoted: quoted?.raw }
+    );
+    return { ok: true, id: result?.key?.id };
   }
 
   async sendPoll(chatId, name, options, multiSelect = false) {
-    const jid = this._jid(chatId);
-    const sent = await this.sock.sendMessage(jid, {
-      poll: { name, values: options, selectableCount: multiSelect ? 0 : 1 }
+    const result = await this.sock.sendMessage(chatId, {
+      poll: { name, values: options, selectableCount: multiSelect ? 0 : 1 },
     });
-    return { ok: true, id: sent.key.id };
+    return { ok: true, id: result?.key?.id };
   }
 
   async sendContact(chatId, { name, phone }) {
-    const jid = this._jid(chatId);
     const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nTEL;type=CELL:${phone}\nEND:VCARD`;
-    const sent = await this.sock.sendMessage(jid, {
-      contacts: { displayName: name, contacts: [{ vcard }] }
+    const result = await this.sock.sendMessage(chatId, {
+      contacts: { displayName: name, contacts: [{ vcard }] },
     });
-    return { ok: true, id: sent.key.id };
+    return { ok: true, id: result?.key?.id };
   }
 
   async sendLocation(chatId, { latitude, longitude, name, address }) {
-    const jid = this._jid(chatId);
-    const sent = await this.sock.sendMessage(jid, {
-      location: { degreesLatitude: latitude, degreesLongitude: longitude, name, address }
+    const result = await this.sock.sendMessage(chatId, {
+      location: {
+        degreesLatitude: Number(latitude),
+        degreesLongitude: Number(longitude),
+        name,
+        address,
+      },
     });
-    return { ok: true, id: sent.key.id };
+    return { ok: true, id: result?.key?.id };
   }
 
-  // ─── Ações de mensagem ───
   async markAsRead(chatId, messageIds) {
-    const jid = this._jid(chatId);
-    const keys = messageIds.map(id => ({ id, remoteJid: jid }));
+    const keys = messageIds.map((id) => ({
+      remoteJid: chatId,
+      id,
+      fromMe: false,
+    }));
     await this.sock.readMessages(keys);
-    // Zera unread
-    if (this.chatsMap.has(jid)) this.chatsMap.get(jid).unreadCount = 0;
+    if (this.chats[chatId]) this.chats[chatId].unreadCount = 0;
   }
 
   async sendReaction(chatId, messageId, emoji) {
-    const jid = this._jid(chatId);
-    await this.sock.sendMessage(jid, {
-      react: { text: emoji || "", key: { id: messageId, remoteJid: jid } }
+    await this.sock.sendMessage(chatId, {
+      react: { text: emoji, key: { remoteJid: chatId, id: messageId } },
     });
   }
 
   async deleteMessage(chatId, messageId, fromMe = true) {
-    const jid = this._jid(chatId);
-    await this.sock.sendMessage(jid, { delete: { id: messageId, remoteJid: jid, fromMe } });
+    await this.sock.sendMessage(chatId, {
+      delete: { remoteJid: chatId, id: messageId, fromMe },
+    });
   }
 
   async editMessage(chatId, messageId, newText) {
-    const jid = this._jid(chatId);
-    const sent = await this.sock.sendMessage(jid, {
+    const result = await this.sock.sendMessage(chatId, {
       text: newText,
-      edit: { id: messageId, remoteJid: jid, fromMe: true },
+      edit: { remoteJid: chatId, id: messageId, fromMe: true },
     });
-    return { ok: true, id: sent?.key?.id };
+    return { ok: true, id: result?.key?.id };
   }
 
   async forwardMessage(fromChatId, toChatId, messageId) {
-    const fromJid = this._jid(fromChatId);
-    const toJid = this._jid(toChatId);
-    const msgs = this.messagesMap.get(fromJid) || [];
-    const msg = msgs.find(m => m.id === messageId);
+    const msgs = this.messages[fromChatId] || [];
+    const msg = msgs.find((m) => m.id === messageId);
     if (!msg?.raw) throw new Error("Mensagem não encontrada");
-    const sent = await this.sock.sendMessage(toJid, { forward: msg.raw });
-    return { ok: true, id: sent?.key?.id };
+    const result = await this.sock.sendMessage(toChatId, {
+      forward: msg.raw,
+    });
+    return { ok: true, id: result?.key?.id };
   }
 
-  // ─── Presença ───
   async sendPresence(chatId, type = "composing") {
-    const jid = this._jid(chatId);
-    await this.sock.sendPresenceUpdate(type, jid);
+    await this.sock.sendPresenceUpdate(type, chatId);
   }
 
-  getPresenceStore() { return this.presenceStore; }
-  getReceiptStore() { return this.receiptStore; }
-
-  // ─── Organização de conversas ───
-  async pinChat(chatId, pin = true) {
-    const jid = this._jid(chatId);
-    await this.sock.chatModify({ pin }, jid, []);
+  getPresenceStore() {
+    return this.presenceStore;
   }
 
-  async archiveChat(chatId, archive = true) {
-    const jid = this._jid(chatId);
-    await this.sock.chatModify({ archive }, jid, []);
+  getReceiptStore() {
+    return this.receiptStore;
   }
 
-  async muteChat(chatId, duration = null) {
-    const jid = this._jid(chatId);
-    const mute = duration ? Date.now() + duration * 1000 : undefined;
-    await this.sock.chatModify({ mute }, jid, []);
+  async pinChat(chatId, pin) {
+    await this.sock.chatModify({ pin }, chatId, []);
   }
 
-  async setEphemeral(chatId, duration = 0) {
-    const jid = this._jid(chatId);
-    await this.sock.sendMessage(jid, { disappearingMessagesInChat: duration });
+  async archiveChat(chatId, archive) {
+    await this.sock.chatModify({ archive }, chatId, []);
   }
 
-  // ─── Perfil e contatos ───
+  async muteChat(chatId, duration) {
+    const mute = duration ? Date.now() + duration * 1000 : null;
+    await this.sock.chatModify({ mute }, chatId, []);
+  }
+
+  async setEphemeral(chatId, duration) {
+    await this.sock.sendMessage(chatId, { disappearingMessagesInChat: duration || false });
+  }
+
   async getProfilePicture(chatId) {
-    const jid = this._jid(chatId);
     try {
-      const url = await this.sock.profilePictureUrl(jid, "image");
+      const url = await this.sock.profilePictureUrl(chatId, "image");
       return { ok: true, url };
     } catch {
       return { ok: true, url: null };
@@ -385,9 +502,8 @@ class WhatsAppSession {
   }
 
   async getAbout(chatId) {
-    const jid = this._jid(chatId);
     try {
-      const result = await this.sock.fetchStatus(jid);
+      const result = await this.sock.fetchStatus(chatId);
       return { ok: true, about: result?.status || null };
     } catch {
       return { ok: true, about: null };
@@ -396,21 +512,20 @@ class WhatsAppSession {
 
   async checkNumber(number) {
     try {
-      const [result] = await this.sock.onWhatsApp(number);
-      return { ok: true, exists: result?.exists || false, jid: result?.jid || null };
+      const jid = number.includes("@") ? number : `${number}@s.whatsapp.net`;
+      const [result] = await this.sock.onWhatsApp(jid);
+      return { ok: true, exists: result?.exists || false, jid: result?.jid || jid };
     } catch {
       return { ok: false, exists: false };
     }
   }
 
   async blockContact(chatId) {
-    const jid = this._jid(chatId);
-    await this.sock.updateBlockStatus(jid, "block");
+    await this.sock.updateBlockStatus(chatId, "block");
   }
 
   async unblockContact(chatId) {
-    const jid = this._jid(chatId);
-    await this.sock.updateBlockStatus(jid, "unblock");
+    await this.sock.updateBlockStatus(chatId, "unblock");
   }
 
   async updateMyProfile({ name, about }) {
@@ -424,56 +539,41 @@ class WhatsAppSession {
     return { ok: true };
   }
 
-  // ─── Grupos ───
   async getGroupMetadata(chatId) {
-    const meta = await this.sock.groupMetadata(chatId);
-    return {
-      id: meta.id,
-      subject: meta.subject,
-      owner: meta.owner,
-      participants: meta.participants,
-      creation: meta.creation,
-      desc: meta.desc,
-    };
+    return await this.sock.groupMetadata(chatId);
   }
 
   async resolveGroupNames(ids) {
-    const results = [];
+    const result = {};
     for (const id of ids) {
       try {
         const meta = await this.sock.groupMetadata(id);
-        results.push({ id, name: meta.subject });
+        result[id] = meta.subject || id;
       } catch {
-        results.push({ id, name: null });
+        result[id] = id;
       }
     }
-    return results;
+    return result;
   }
 
   async createGroup(name, participants) {
-    const jids = participants.map(p => this._jid(p));
-    const result = await this.sock.groupCreate(name, jids);
-    return { id: result.id, subject: result.subject };
+    return await this.sock.groupCreate(name, participants);
   }
 
   async addToGroup(groupId, participants) {
-    const jids = participants.map(p => this._jid(p));
-    return await this.sock.groupParticipantsUpdate(groupId, jids, "add");
+    return await this.sock.groupParticipantsUpdate(groupId, participants, "add");
   }
 
   async removeFromGroup(groupId, participants) {
-    const jids = participants.map(p => this._jid(p));
-    return await this.sock.groupParticipantsUpdate(groupId, jids, "remove");
+    return await this.sock.groupParticipantsUpdate(groupId, participants, "remove");
   }
 
   async promoteInGroup(groupId, participants) {
-    const jids = participants.map(p => this._jid(p));
-    return await this.sock.groupParticipantsUpdate(groupId, jids, "promote");
+    return await this.sock.groupParticipantsUpdate(groupId, participants, "promote");
   }
 
   async demoteInGroup(groupId, participants) {
-    const jids = participants.map(p => this._jid(p));
-    return await this.sock.groupParticipantsUpdate(groupId, jids, "demote");
+    return await this.sock.groupParticipantsUpdate(groupId, participants, "demote");
   }
 
   async getGroupInviteLink(groupId) {
@@ -494,7 +594,7 @@ class WhatsAppSession {
     await this.sock.groupUpdateDescription(groupId, description);
   }
 
-  async setGroupMessagesAdminsOnly(groupId, adminsOnly = true) {
+  async setGroupMessagesAdminsOnly(groupId, adminsOnly) {
     await this.sock.groupSettingUpdate(groupId, adminsOnly ? "announcement" : "not_announcement");
   }
 
@@ -502,76 +602,89 @@ class WhatsAppSession {
     await this.sock.groupLeave(groupId);
   }
 
-  // ─── Reiniciar ───
+  getUpdates(since = 0) {
+    const filtered = this.updates.filter((u) => u.seq > since);
+    return {
+      ok: true,
+      updates: filtered.slice(-200),
+      seq: this.updateSeq,
+      chatCount: Object.keys(this.chats).length,
+      connection: this.status.connection,
+    };
+  }
+
   async restart() {
-    if (this._keepAlive) clearInterval(this._keepAlive);
-    if (this.sock) try { this.sock.end(); } catch {}
-    if (fs.existsSync(this.authDir)) {
-      fs.rmSync(this.authDir, { recursive: true, force: true });
-      fs.mkdirSync(this.authDir, { recursive: true });
+    this._stopKeepAlive();
+    try { this.sock?.end(); } catch {}
+    if (fs.existsSync(this.sessionPath)) {
+      fs.rmSync(this.sessionPath, { recursive: true, force: true });
     }
-    this.status = { connection: "close", qr: null, hasQr: false, lastDisconnectCode: null, lastError: null };
-    this.chatsMap.clear();
-    this.messagesMap.clear();
-    this.presenceStore = {};
-    this.receiptStore = {};
-    await this.connect();
+    this.status = { connection: "close", qr: null, hasQr: false };
+    await this.start();
   }
 
-  async destroy() {
-    if (this._keepAlive) clearInterval(this._keepAlive);
-    if (this.sock) try { this.sock.end(); } catch {}
-  }
-
-  _pushSent(jid, sent) {
-    if (!this.messagesMap.has(jid)) this.messagesMap.set(jid, []);
-    this.messagesMap.get(jid).push(this._normalizeMsg(sent));
+  destroy() {
+    this._stopKeepAlive();
+    try { this.sock?.end(); } catch {}
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SessionManager (singleton)
+// CLASSE: SessionManager
 // ═══════════════════════════════════════════════════════════════
-class SessionManager {
-  constructor() { this.sessions = new Map(); }
 
-  get(sessionId) { return this.sessions.get(sessionId) || null; }
+class SessionManager {
+  constructor() {
+    this.sessions = new Map();
+  }
+
+  get(sessionId) {
+    return this.sessions.get(sessionId) || null;
+  }
 
   async getOrCreate(sessionId) {
     if (this.sessions.has(sessionId)) return this.sessions.get(sessionId);
     const session = new WhatsAppSession(sessionId);
     this.sessions.set(sessionId, session);
-    await session.connect();
+    await session.start();
     return session;
   }
 
   async destroy(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
-    await session.destroy();
+    session.destroy();
     this.sessions.delete(sessionId);
+    const sessionPath = path.join(SESSIONS_DIR, sessionId);
+    if (fs.existsSync(sessionPath)) {
+      fs.rmSync(sessionPath, { recursive: true, force: true });
+    }
     return true;
   }
 
   listSessions() {
-    return Array.from(this.sessions.entries()).map(([id, s]) => ({ id, ...s.getStatus() }));
+    const list = [];
+    for (const [id, session] of this.sessions) {
+      list.push({ sessionId: id, ...session.getStatus() });
+    }
+    return list;
   }
 
   async restoreFromDisk() {
     if (!fs.existsSync(SESSIONS_DIR)) return;
     const dirs = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory()).map(d => d.name);
-    console.log(`[SessionManager] Encontradas ${dirs.length} sessões no disco`);
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+    console.log(`[SessionManager] Restaurando ${dirs.length} sessão(ões)...`);
     for (const dir of dirs) {
       try {
         await this.getOrCreate(dir);
-        console.log(`[SessionManager] Restaurada: ${dir}`);
+        console.log(`[SessionManager] ✅ ${dir} restaurada`);
       } catch (err) {
-        console.error(`[SessionManager] Erro ao restaurar ${dir}:`, err.message);
+        console.error(`[SessionManager] ❌ ${dir}:`, err.message);
       }
     }
   }
 }
 
 export const sessionManager = new SessionManager();
-export { MEDIA_BASE_DIR };
