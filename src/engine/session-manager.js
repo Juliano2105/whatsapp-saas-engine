@@ -51,6 +51,227 @@ class WhatsAppSession {
     return p;
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // AUTOMAÇÃO — callAutomationDecide / executeDecision / logOutbound
+  // ═══════════════════════════════════════════════════════════════
+
+  async callAutomationDecide(msg, text) {
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const ENGINE_KEY = process.env.ENGINE_AUTOMATION_KEY;
+    if (!SUPABASE_URL || !ENGINE_KEY) return null;
+
+    try {
+      const res = await fetch(
+        `${SUPABASE_URL}/functions/v1/automation-engine/${this.sessionId}/decide`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-engine-key": ENGINE_KEY,
+          },
+          body: JSON.stringify({
+            contactJid: msg.key.remoteJid,
+            inboundMessageId: msg.key.id,
+            inboundText: text,
+          }),
+        }
+      );
+      if (!res.ok) {
+        console.error(`[${this.sessionId}][automation] /decide HTTP ${res.status}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err) {
+      console.error(`[${this.sessionId}][automation] /decide error:`, err.message);
+      return null;
+    }
+  }
+
+  async logOutbound(contactJid, messageId, body) {
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const ENGINE_KEY = process.env.ENGINE_AUTOMATION_KEY;
+    if (!SUPABASE_URL || !ENGINE_KEY) return;
+
+    try {
+      await fetch(
+        `${SUPABASE_URL}/functions/v1/automation-engine/${this.sessionId}/log-outbound`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-engine-key": ENGINE_KEY,
+          },
+          body: JSON.stringify({
+            contactJid,
+            outboundMessageId: messageId,
+            body,
+          }),
+        }
+      );
+    } catch (err) {
+      console.error(`[${this.sessionId}][automation] log-outbound error:`, err.message);
+    }
+  }
+
+  async executeDecision(decision, contactJid) {
+    if (!decision || !decision.shouldProcess) return;
+    if (decision.action === "no_action") return;
+
+    try {
+      // ── robot_reply: resposta direta do robô ──
+      if (decision.action === "robot_reply" && decision.text) {
+        const sent = await this.sendText(contactJid, decision.text);
+        await this.logOutbound(contactJid, sent.id, decision.text);
+        console.log(`[${this.sessionId}][automation] robot_reply -> ${contactJid}`);
+        return;
+      }
+
+      // ── funnel_start / funnel_continue: buscar conteúdo do passo ──
+      if (decision.action === "funnel_start" || decision.action === "funnel_continue") {
+        const SUPABASE_URL = process.env.SUPABASE_URL;
+        const ENGINE_KEY = process.env.ENGINE_AUTOMATION_KEY;
+
+        const stepRes = await fetch(
+          `${SUPABASE_URL}/functions/v1/automation-engine/${this.sessionId}/funnels/${decision.funnelId}/steps/${decision.nextStepOrder}`,
+          {
+            headers: { "x-engine-key": ENGINE_KEY },
+          }
+        );
+        if (!stepRes.ok) {
+          console.error(`[${this.sessionId}][automation] step fetch HTTP ${stepRes.status}`);
+          return;
+        }
+        const step = await stepRes.json();
+
+        // Delay configurado no passo
+        if (step.delay_seconds > 0) {
+          await new Promise((r) => setTimeout(r, step.delay_seconds * 1000));
+        }
+
+        // Enviar conteúdo baseado no tipo
+        if (step.message_type === "text" || !step.message_type) {
+          const sent = await this.sendText(contactJid, step.content);
+          await this.logOutbound(contactJid, sent.id, step.content);
+        } else if (step.message_type === "image" && step.content) {
+          try {
+            const imgRes = await fetch(step.content);
+            const buffer = Buffer.from(await imgRes.arrayBuffer());
+            await this.sendMedia(contactJid, { type: "image", buffer, mimetype: "image/jpeg" });
+          } catch (e) {
+            console.error(`[${this.sessionId}][automation] image send error:`, e.message);
+          }
+        } else if (step.message_type === "audio" && step.content) {
+          try {
+            const audioRes = await fetch(step.content);
+            const buffer = Buffer.from(await audioRes.arrayBuffer());
+            await this.sendMedia(contactJid, { type: "audio", buffer, mimetype: "audio/ogg; codecs=opus", ptt: true });
+          } catch (e) {
+            console.error(`[${this.sessionId}][automation] audio send error:`, e.message);
+          }
+        } else if (step.message_type === "video" && step.content) {
+          try {
+            const vidRes = await fetch(step.content);
+            const buffer = Buffer.from(await vidRes.arrayBuffer());
+            await this.sendMedia(contactJid, { type: "video", buffer, mimetype: "video/mp4" });
+          } catch (e) {
+            console.error(`[${this.sessionId}][automation] video send error:`, e.message);
+          }
+        } else {
+          // Fallback: enviar como texto
+          if (step.content) {
+            const sent = await this.sendText(contactJid, step.content);
+            await this.logOutbound(contactJid, sent.id, step.content);
+          }
+        }
+
+        console.log(`[${this.sessionId}][automation] funnel step ${decision.nextStepOrder} -> ${contactJid}`);
+        return;
+      }
+
+      // ── ai_step: passo de funil com IA ──
+      if (decision.action === "ai_step") {
+        const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
+        if (!LOVABLE_API_KEY) {
+          console.error(`[${this.sessionId}][automation] LOVABLE_API_KEY not set`);
+          return;
+        }
+
+        const prompt = decision.aiInstruction || "Responda de forma profissional.";
+        const aiRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "google/gemini-2.5-flash",
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 700,
+            temperature: 0.7,
+          }),
+        });
+
+        if (aiRes.ok) {
+          const aiData = await aiRes.json();
+          const reply = aiData.choices?.[0]?.message?.content;
+          if (reply) {
+            if (decision.delaySeconds > 0) {
+              await new Promise((r) => setTimeout(r, decision.delaySeconds * 1000));
+            }
+            const sent = await this.sendText(contactJid, reply);
+            await this.logOutbound(contactJid, sent.id, reply);
+            console.log(`[${this.sessionId}][automation] ai_step reply -> ${contactJid}`);
+          }
+        } else {
+          console.error(`[${this.sessionId}][automation] AI HTTP ${aiRes.status}`);
+        }
+        return;
+      }
+
+      // ── ai_reply: IA fallback (sem funil) ──
+      if (decision.action === "ai_reply") {
+        const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
+        if (!LOVABLE_API_KEY) {
+          console.error(`[${this.sessionId}][automation] LOVABLE_API_KEY not set`);
+          return;
+        }
+
+        const aiRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: decision.model || "google/gemini-2.5-flash",
+            messages: [{ role: "user", content: decision.prompt }],
+            max_tokens: decision.maxTokens || 700,
+            temperature: decision.temperature || 0.7,
+          }),
+        });
+
+        if (aiRes.ok) {
+          const aiData = await aiRes.json();
+          const reply = aiData.choices?.[0]?.message?.content;
+          if (reply) {
+            const sent = await this.sendText(contactJid, reply);
+            await this.logOutbound(contactJid, sent.id, reply);
+            console.log(`[${this.sessionId}][automation] ai_reply -> ${contactJid}`);
+          }
+        } else {
+          console.error(`[${this.sessionId}][automation] AI HTTP ${aiRes.status}`);
+        }
+        return;
+      }
+    } catch (err) {
+      console.error(`[${this.sessionId}][automation] executeDecision error:`, err.message);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // CONEXÃO BAILEYS
+  // ═══════════════════════════════════════════════════════════════
+
   async start() {
     const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
     const { version } = await fetchLatestBaileysVersion();
@@ -166,6 +387,9 @@ class WhatsAppSession {
       }
     });
 
+    // ═══════════════════════════════════════════════════════════════
+    // messages.upsert — COM HOOK DE AUTOMAÇÃO
+    // ═══════════════════════════════════════════════════════════════
     this.sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
       for (const msg of msgs) {
         const chatId = msg.key.remoteJid;
@@ -205,6 +429,28 @@ class WhatsAppSession {
             await this._saveMedia(msg);
           } catch (err) {
             console.error(`[${this.sessionId}] Erro _saveMedia:`, err.message);
+          }
+        }
+
+        // ══════════════════════════════════════════════════════════
+        // AUTOMAÇÃO: processar mensagens recebidas (não fromMe)
+        // ══════════════════════════════════════════════════════════
+        if (!msg.key.fromMe && chatId !== "status@broadcast") {
+          const msgObj = msg.message || {};
+          const textForAutomation =
+            msgObj.conversation ||
+            msgObj.extendedTextMessage?.text ||
+            msgObj.imageMessage?.caption ||
+            msgObj.videoMessage?.caption ||
+            "";
+
+          try {
+            const decision = await this.callAutomationDecide(msg, textForAutomation);
+            if (decision) {
+              await this.executeDecision(decision, chatId);
+            }
+          } catch (err) {
+            console.error(`[${this.sessionId}][automation] error:`, err.message);
           }
         }
       }
@@ -328,7 +574,6 @@ class WhatsAppSession {
           }
         : null,
       raw,
-      // Campos de mídia — preenchidos pelo _saveMedia após download
       mediaUrl: null,
       mimeType: mediaInfo?.sub?.mimetype || null,
       fileName: mediaInfo?.sub?.fileName || null,
@@ -350,7 +595,6 @@ class WhatsAppSession {
       fs.writeFileSync(filePath, buffer);
       console.log(`[${this.sessionId}] Mídia salva: ${fileName} (${buffer.length} bytes)`);
 
-      // Atualizar a mensagem no store com a URL da mídia
       const chatId = msg.key.remoteJid;
       if (this.messages[chatId]) {
         const idx = this.messages[chatId].findIndex((m) => m.id === msg.key.id);
@@ -436,7 +680,6 @@ class WhatsAppSession {
     }
     const result = await this.sock.sendMessage(chatId, content);
 
-    // Salvar a mídia enviada no disco também
     if (result?.key?.id) {
       try {
         let ext = ".bin";
