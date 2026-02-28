@@ -76,6 +76,21 @@ app.get("/:sessionId/qr.png", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// 1.1 PROXY STATUS (NOVO)
+// ═══════════════════════════════════════════════════════════════
+
+app.get("/:sessionId/proxy-status", async (req, res) => {
+  const session = await getSession(req, res);
+  if (!session) return;
+  try {
+    const ip = await session.checkExternalIp();
+    res.json({ ok: true, proxyActive: ip !== "unknown", externalIp: ip });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // 2. CONVERSAS
 // ═══════════════════════════════════════════════════════════════
 
