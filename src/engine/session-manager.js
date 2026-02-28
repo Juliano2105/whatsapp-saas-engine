@@ -15,6 +15,10 @@ import pino from "pino";
 import fs from "fs";
 import path from "path";
 import { Boom } from "@hapi/boom";
+// ── PROXY: imports adicionais ──
+import { SocksProxyAgent } from "socks-proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { createClient } from "@supabase/supabase-js";
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
 export const MEDIA_BASE_DIR = process.env.MEDIA_DIR || "./media";
@@ -49,6 +53,58 @@ class WhatsAppSession {
     const p = path.join(MEDIA_BASE_DIR, this.sessionId);
     if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
     return p;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // PROXY — buildProxyAgent / checkExternalIp
+  // ═══════════════════════════════════════════════════════════════
+
+  async buildProxyAgent() {
+    try {
+      const url = process.env.SUPABASE_URL;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (!url || !key) return undefined;
+
+      const sb = createClient(url, key);
+      const { data } = await sb
+        .from("engine_proxy_config")
+        .select("*")
+        .eq("engine_id", this.sessionId)
+        .eq("enabled", true)
+        .maybeSingle();
+
+      if (!data || data.proxy_type === "none") return undefined;
+
+      const user = data.proxy_username || "";
+      const pass = data.proxy_password || "";
+      const auth = user ? `${user}:${pass}@` : "";
+
+      const proxyUrl = data.proxy_type === "socks5"
+        ? `socks5://${auth}${data.proxy_host}:${data.proxy_port}`
+        : `http://${auth}${data.proxy_host}:${data.proxy_port}`;
+
+      const agent = data.proxy_type === "socks5"
+        ? new SocksProxyAgent(proxyUrl)
+        : new HttpsProxyAgent(proxyUrl);
+
+      console.log(`[${this.sessionId}] Proxy ${data.proxy_type} configurado: ${data.proxy_host}:${data.proxy_port}`);
+      return agent;
+    } catch (err) {
+      console.error(`[${this.sessionId}] Erro ao carregar proxy:`, err.message);
+      return undefined;
+    }
+  }
+
+  async checkExternalIp() {
+    try {
+      const agent = await this.buildProxyAgent();
+      const opts = agent ? { agent } : {};
+      const res = await fetch("https://api.ipify.org?format=json", opts);
+      const data = await res.json();
+      return data.ip;
+    } catch {
+      return "unknown";
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -276,6 +332,13 @@ class WhatsAppSession {
     const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
     const { version } = await fetchLatestBaileysVersion();
 
+    // ── PROXY: carregar agente de proxy (se configurado) ──
+    const agent = await this.buildProxyAgent();
+    if (agent) {
+      const ip = await this.checkExternalIp();
+      console.log(`[${this.sessionId}] Usando proxy residencial — IP externo: ${ip}`);
+    }
+
     this.sock = makeWASocket({
       version,
       auth: {
@@ -287,6 +350,7 @@ class WhatsAppSession {
       syncFullHistory: true,
       generateHighQualityLinkPreview: true,
       markOnlineOnConnect: true,
+      agent, // ── PROXY: passa o agente ao Baileys (undefined = conexão direta) ──
     });
 
     this.sock.ev.on("creds.update", saveCreds);
