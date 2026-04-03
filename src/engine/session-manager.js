@@ -85,6 +85,23 @@ class WhatsAppSession {
       return undefined;
     }
   }
+  async checkExternalIp() {
+    try {
+      const options = {};
+      if (this.proxyAgent) {
+        options.agent = this.proxyAgent;
+      }
+      const res = await fetch("https://api.ipify.org?format=json", options);
+      if (res.ok) {
+        const data = await res.json();
+        return data.ip;
+      }
+    } catch (err) {
+      console.error(`[session:${this.sessionId}][proxy] IP check failed:`, err.message);
+    }
+    return null;
+  }
+
 
   // ─── Detectar tipo de mídia ──────────────────────────────────
   detectMediaType(msg) {
