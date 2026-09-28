@@ -188,6 +188,10 @@ async function upsertMessage(chatId, m) {
   messagesMap.set(chatId, arr);
 
   const existing = chatsMap.get(chatId) || { chatId, name: chatId };
+  // Only trust pushName from an INCOMING message. For a message WE sent
+  // (fromMe, synced from another linked device), WhatsApp reports OUR OWN
+  // push name here — using it would leak our name as the contact's name.
+  const incomingPushName = !m.key?.fromMe ? (m.pushName || null) : null;
   let preview = item.text;
   if (!preview && mediaData) {
     const icons = { image: "📷 Foto", video: "🎬 Vídeo", audio: "🎵 Áudio", document: "📎 Documento", sticker: "🖼️ Figurinha" };
@@ -200,7 +204,7 @@ async function upsertMessage(chatId, m) {
     chatId,
     lastMessage: preview || (item.fromMe ? "Mensagem enviada" : "Mensagem"),
     lastTimestamp: item.timestamp,
-    name: existing.name || m.pushName || chatId
+    name: existing.name || incomingPushName || chatId
   });
 
   updateLog.push({ ts: Date.now(), type: "message", chatId, msgId });
