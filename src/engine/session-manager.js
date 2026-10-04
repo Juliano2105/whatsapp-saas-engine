@@ -19,6 +19,19 @@ const {
 const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
 const MEDIA_BASE_DIR = process.env.MEDIA_DIR || "./media";
 
+// fetch com timeout: evita que uma chamada travada bloqueie a fila de mensagens
+const fetchT = (url, opts = {}, ms = 30000) =>
+  fetch(url, { ...opts, signal: opts.signal || AbortSignal.timeout(ms) });
+
+// logger enxuto para o Baileys (o padrao escreve uma linha por evento e pesa no Railway)
+const quietLogger = {
+  level: "silent",
+  child() { return quietLogger; },
+  trace() {}, debug() {}, info() {}, warn() {},
+  error(...a) { console.error("[baileys]", ...a); },
+  fatal(...a) { console.error("[baileys]", ...a); },
+};
+
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 if (!fs.existsSync(MEDIA_BASE_DIR)) fs.mkdirSync(MEDIA_BASE_DIR, { recursive: true });
 
@@ -55,7 +68,7 @@ class WhatsAppSession {
       const key = process.env.ENGINE_AUTOMATION_KEY;
       if (!url || !key) return undefined;
 
-      const res = await fetch(
+      const res = await fetchT(
         `${url}/functions/v1/get-proxy-config?engine_id=${this.sessionId}`,
         { headers: { Authorization: `Bearer ${key}` } }
       );
@@ -91,7 +104,7 @@ class WhatsAppSession {
       if (this.proxyAgent) {
         options.agent = this.proxyAgent;
       }
-      const res = await fetch("https://api.ipify.org?format=json", options);
+      const res = await fetchT("https://api.ipify.org?format=json", options);
       if (res.ok) {
         const data = await res.json();
         return data.ip;
@@ -128,7 +141,7 @@ class WhatsAppSession {
       const buffer = await downloadMediaMessage(msg, "buffer", {});
       const fileName = `${msg.key.id}${mediaInfo.ext}`;
       const filePath = path.join(this.mediaFolder, fileName);
-      fs.writeFileSync(filePath, buffer);
+      await fs.promises.writeFile(filePath, buffer);
 
       return {
         type: mediaInfo.type,
@@ -227,7 +240,7 @@ class WhatsAppSession {
     if (!SUPABASE_URL || !ENGINE_KEY) return null;
 
     try {
-      const res = await fetch(
+      const res = await fetchT(
         `${SUPABASE_URL}/functions/v1/automation-engine/${this.sessionId}/decide`,
         {
           method: "POST",
@@ -265,7 +278,7 @@ class WhatsAppSession {
       } else if (decision.action === "funnel_start" || decision.action === "funnel_continue") {
         const SUPABASE_URL = process.env.SUPABASE_URL;
         const ENGINE_KEY = process.env.ENGINE_AUTOMATION_KEY;
-        const stepRes = await fetch(
+        const stepRes = await fetchT(
           `${SUPABASE_URL}/functions/v1/automation-engine/${this.sessionId}/funnels/${decision.funnelId}/steps/${decision.nextStepOrder}`,
           {
             headers: { "x-engine-key": ENGINE_KEY },
@@ -287,7 +300,7 @@ class WhatsAppSession {
           return;
         }
         const prompt = decision.action === "ai_reply" ? decision.prompt : (decision.aiInstruction || "Responda de forma profissional.");
-        const aiRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+        const aiRes = await fetchT("https://ai.gateway.lovable.dev/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -331,6 +344,7 @@ class WhatsAppSession {
       version,
       auth: state,
       printQRInTerminal: false,
+      logger: quietLogger,
     };
 
     // Se tem proxy, adicionar o agent ao socket
@@ -361,6 +375,7 @@ class WhatsAppSession {
         this.status.qr = null;
         this.status.lastError = null;
         console.log(`[session:${this.sessionId}] WhatsApp conectado`);
+        this.reconnectAttempts = 0;
       }
 
       if (connection === "close") {
@@ -371,15 +386,28 @@ class WhatsAppSession {
           return;
         }
 
-        setTimeout(() => this.connect(), 3000);
+        const retry = () => {
+          this.reconnectAttempts = (this.reconnectAttempts || 0) + 1;
+          const delay = Math.min(3000 * 2 ** (this.reconnectAttempts - 1), 60000);
+          console.log(`[session:${this.sessionId}] Reconectando em ${delay}ms (tentativa ${this.reconnectAttempts})`);
+          try { socket.end(undefined); } catch {}
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = setTimeout(() => {
+            this.connect().catch((err) => {
+              console.error(`[session:${this.sessionId}] Falha ao reconectar:`, err.message);
+              retry();
+            });
+          }, delay);
+        };
+        retry();
       }
     });
 
-    socket.ev.on("messages.upsert", async ({ messages }) => {
+    socket.ev.on("messages.upsert", async ({ messages, type }) => {
       for (const msg of messages || []) {
         await this.onBaileysMessage(msg);
 
-        if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== "status@broadcast") {
+        if (type === "notify" && !msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== "status@broadcast") {
           const msgObj = msg.message || {};
           const text =
             msgObj.conversation ||
@@ -388,10 +416,10 @@ class WhatsAppSession {
             msgObj.videoMessage?.caption ||
             "";
           
-          const decision = await this.callAutomationDecide(msg, text);
-          if (decision) {
-            await this.executeDecision(decision, msg.key.remoteJid);
-          }
+          // nao bloqueia a fila: a automacao roda em segundo plano (com timeout nas chamadas)
+          this.callAutomationDecide(msg, text)
+            .then((decision) => (decision ? this.executeDecision(decision, msg.key.remoteJid) : null))
+            .catch((err) => console.error(`[session:${this.sessionId}][automation] erro:`, err.message));
         }
       }
     });
