@@ -510,20 +510,60 @@ class WhatsAppSession {
     return { ok: true, items, serverNow: Date.now() };
   }
 
+  // ─── Resolução de JID (números BR com/sem nono dígito) ───────
+  brCandidates(input) {
+    const d = String(input || "").replace(/\D/g, "");
+    if (d.startsWith("55") && (d.length === 12 || d.length === 13)) {
+      const ddd = d.slice(2, 4);
+      const local = d.slice(4);
+      const com9 = local.length === 9 ? d : (/^[6-9]/.test(local) ? `55${ddd}9${local}` : d);
+      const sem9 = (local.length === 9 && local[0] === "9") ? `55${ddd}${local.slice(1)}` : d;
+      return [...new Set([com9, sem9])];
+    }
+    return [d];
+  }
+
+  async resolveJid(chatId) {
+    if (String(chatId).includes("@")) return { jid: chatId, exists: null };
+    const cands = this.brCandidates(chatId);
+    const fallback = `${cands[cands.length - 1]}@s.whatsapp.net`;
+    try {
+      const res = await this.sock.onWhatsApp(...cands.map((n) => `${n}@s.whatsapp.net`));
+      const hit = (res || []).find((r) => r.exists);
+      if (hit) return { jid: hit.jid, exists: true, tried: cands };
+      return { jid: null, exists: false, tried: cands };
+    } catch (err) {
+      console.error(`[session:${this.sessionId}] onWhatsApp falhou:`, err.message);
+      return { jid: fallback, exists: null, tried: cands };
+    }
+  }
+
+  async checkNumber(number) {
+    if (!this.sock || this.status.connection !== "open") {
+      throw new Error("WhatsApp not connected");
+    }
+    const r = await this.resolveJid(number);
+    return { ok: true, existe: r.exists === true, jid: r.exists ? r.jid : null, tried: r.tried };
+  }
+
   async sendText(chatId, text) {
     if (!this.sock || this.status.connection !== "open") {
       throw new Error("WhatsApp not connected");
     }
-    const jid = chatId.includes("@") ? chatId : chatId + "@s.whatsapp.net";
+    const r = await this.resolveJid(chatId);
+    if (r.exists === false) { const e = new Error("numero_sem_whatsapp"); e.status = 422; e.tried = r.tried; throw e; }
+    const jid = r.jid;
     const sent = await this.sock.sendMessage(jid, { text });
-    return { ok: true, id: sent.key.id };
+    return { ok: true, id: sent.key.id, jid };
   }
 
   async sendMedia(chatId, { type, buffer, mimetype, fileName, caption, ptt }) {
     if (!this.sock || this.status.connection !== "open") {
       throw new Error("WhatsApp not connected");
     }
-    const jid = chatId.includes("@") ? chatId : chatId + "@s.whatsapp.net";
+    const r = await this.resolveJid(chatId);
+    if (r.exists === false) { const e = new Error("numero_sem_whatsapp"); e.status = 422; e.tried = r.tried; throw e; }
+    const jid = r.jid;
     const payload = {};
 
     if (type === "image") payload.image = buffer;
@@ -540,7 +580,7 @@ class WhatsAppSession {
     if (caption) payload.caption = caption;
 
     const sent = await this.sock.sendMessage(jid, payload);
-    return { ok: true, id: sent.key.id };
+    return { ok: true, id: sent.key.id, jid };
   }
 
   async getProfilePicture(chatId) {
