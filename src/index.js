@@ -127,7 +127,7 @@ app.post("/:sessionId/send", async (req, res) => {
     if (!chat_id || !text) return res.status(400).json({ ok: false, error: "chat_id e text obrigatórios" });
     const result = await session.sendText(chat_id, text);
     res.json(result);
-  } catch (e) { res.status(500).json({ ok: false, error: e?.message }); }
+  } catch (e) { res.status(e.status || 500).json({ ok: false, error: e?.message, tried: e.tried }); }
 });
 
 app.post("/:sessionId/send-media", async (req, res) => {
@@ -138,7 +138,7 @@ app.post("/:sessionId/send-media", async (req, res) => {
     const buffer = Buffer.from(base64, "base64");
     const result = await session.sendMedia(chat_id, { type, buffer, mimetype, fileName, caption, ptt });
     res.json(result);
-  } catch (e) { res.status(500).json({ ok: false, error: e?.message }); }
+  } catch (e) { res.status(e.status || 500).json({ ok: false, error: e?.message, tried: e.tried }); }
 });
 
 app.post("/:sessionId/reply", async (req, res) => {
@@ -333,6 +333,16 @@ app.get("/:sessionId/about", async (req, res) => {
     const result = await session.getAbout(chatId);
     res.json(result);
   } catch (e) { res.status(500).json({ ok: false, error: e?.message }); }
+});
+
+app.get("/:sessionId/check", async (req, res) => {
+const session = await getSession(req, res); if (!session) return;
+try {
+const numero = req.query.numero;
+if (!numero) return res.status(400).json({ ok: false, error: "numero obrigatório" });
+const r = await session.checkNumber(numero);
+res.json({ existe: r.existe, jid: r.jid, tried: r.tried });
+} catch (e) { res.status(500).json({ ok: false, error: e?.message }); }
 });
 
 app.get("/:sessionId/check-number", async (req, res) => {
